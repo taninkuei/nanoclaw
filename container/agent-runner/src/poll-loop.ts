@@ -382,6 +382,16 @@ async function processQuery(
         // effectively orphaned and the next message started a blank
         // Claude session with no prior context.
         setContinuation(providerName, event.continuation);
+      } else if (event.type === 'error' && event.classification === 'quota') {
+        markCompleted(initialBatchIds);
+        writeMessageOut({
+          id: generateId(),
+          kind: 'chat',
+          platform_id: routing.platformId,
+          channel_type: routing.channelType,
+          thread_id: routing.threadId,
+          content: JSON.stringify({ text: event.message }),
+        });
       } else if (event.type === 'result') {
         // A result — with or without text — means the turn is done. Mark
         // the initial batch completed now so the host sweep doesn't see
@@ -391,17 +401,28 @@ async function processQuery(
         // at all — either way the turn is finished.
         markCompleted(initialBatchIds);
         if (event.text) {
-          const { hasUnwrapped } = dispatchResultText(event.text, routing);
-          if (hasUnwrapped && !unwrappedNudged) {
-            unwrappedNudged = true;
-            const destinations = getAllDestinations();
-            const names = destinations.map((d) => d.name).join(', ');
-            query.push(
-              `<system>Your response was not delivered — it was not wrapped in <message to="name">...</message> blocks. ` +
-                `All output must be wrapped: use <message to="name"> for content to send, or <internal> for scratchpad. ` +
-                `Your destinations: ${names}. ` +
-                `Please re-send your response with the correct wrapping.</system>`,
-            );
+          // Context compaction: the SDK emits a bare "Context compacted (N tokens
+          // compacted)." result with no <message> blocks. After compaction the SDK
+          // may not emit further events even when messages are pushed, causing the
+          // for-await loop to hang until the 30-min heartbeat ceiling fires.
+          // End the stream immediately so the outer loop starts fresh on the next
+          // user message instead of waiting indefinitely.
+          if (/^Context compacted/i.test(event.text.trimStart())) {
+            log('Context compaction detected — ending stream so outer loop restarts cleanly');
+            query.end();
+          } else {
+            const { hasUnwrapped } = dispatchResultText(event.text, routing);
+            if (hasUnwrapped && !unwrappedNudged) {
+              unwrappedNudged = true;
+              const destinations = getAllDestinations();
+              const names = destinations.map((d) => d.name).join(', ');
+              query.push(
+                `<system>Your response was not delivered — it was not wrapped in <message to="name">...</message> blocks. ` +
+                  `All output must be wrapped: use <message to="name"> for content to send, or <internal> for scratchpad. ` +
+                  `Your destinations: ${names}. ` +
+                  `Please re-send your response with the correct wrapping.</system>`,
+              );
+            }
           }
         }
       }
