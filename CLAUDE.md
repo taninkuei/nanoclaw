@@ -149,6 +149,37 @@ The `on_wake` column on `messages_in` ensures wake messages are only picked up b
 
 Key files: `src/container-restart.ts`, `src/container-runner.ts` (`killContainer`), `container/agent-runner/src/db/messages-in.ts` (`getPendingMessages`).
 
+## Stream-stall handling (silent hang recovery)
+
+The SDK can go fully silent mid-turn — most often a post-compaction synthesis
+hang, where tool calls finish and the next turn emits **zero** events until
+something kills it. This is a known, multi-repo Anthropic bug. Two layers
+defend against it:
+
+1. **CLI byte watchdog (inner, primary).** The spawned Claude Code CLI has its
+   own SSE-byte/ping-aware watchdog. It runs *below* the Agent SDK event layer,
+   which silently drops the API's `ping` liveness events — so unlike anything we
+   can build on `query.events`, it can tell a live-but-quiet stream (extended
+   thinking, compaction) from a dead one. Enabled via env vars fed into the
+   spawned CLI from `container/agent-runner/src/providers/claude.ts`:
+   `CLAUDE_ENABLE_STREAM_WATCHDOG=1`, `CLAUDE_ENABLE_BYTE_WATCHDOG=1`,
+   `CLAUDE_STREAM_IDLE_TIMEOUT_MS=120000` (all operator-overridable from host
+   env; set the `ENABLE` vars to `0` to disable). When it fires it throws
+   `Stream idle timeout - partial response received`; `translateEvents` catches
+   that (`STREAM_IDLE_RE`) and ends the stream cleanly so the poll loop resumes
+   from the server-cached prefix, instead of surfacing a raw error to the user.
+2. **Poll-loop stream-idle watchdog (outer, backstop).** `poll-loop.ts:301` —
+   ends the stream after 5 min of total SDK-event silence with no tool in flight
+   (`isToolInFlight()`). Catches whatever the inner watchdog misses, and remains
+   the sole defense if the env vars aren't honored on the pinned CLI version.
+
+**This change requires a container image rebuild to take effect** (the env vars
+are baked into the agent-runner spawn): `./container/build.sh`, then restart the
+service. **Validate** on a task that triggers extended thinking or compaction;
+confirm the CLI version actually *throws* the idle-timeout text (vs. emitting it
+as a system message) — if it surfaces differently, widen `STREAM_IDLE_RE`. The
+firing is visible in container logs as `CLI stream-idle watchdog fired ...`.
+
 ## Secrets / Credentials / OneCLI
 
 API keys, OAuth tokens, and auth credentials are managed by the OneCLI gateway. Secrets are injected into per-agent containers at request time — none are passed in env vars or through chat context. The container agent sees this via the `onecli-gateway` container skill (`container/skills/onecli-gateway/SKILL.md`), which teaches it how the proxy works, how to handle auth errors, and to never ask for raw credentials. Host-side wiring: `src/onecli-approvals.ts`, `ensureAgent()` in `container-runner.ts`. Run `onecli --help`.

@@ -318,11 +318,32 @@ function transcriptStartMs(transcriptPath: string): number | null {
 const CLAUDE_CODE_AUTO_COMPACT_WINDOW = process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW || '165000';
 
 /**
+ * Stream-stall watchdog inside the spawned Claude Code CLI. This runs *below*
+ * the Agent SDK event layer, which silently drops the SSE `ping` events the API
+ * emits during extended thinking / post-compaction synthesis. Because the CLI's
+ * byte watchdog sees those raw pings, it can tell a live-but-quiet stream from a
+ * genuinely dead one — the ping-awareness our own poll-loop watchdog
+ * structurally cannot have (it only sees translated `query.events`). Defaulting
+ * the timeout to 120s is safe precisely because it's ping-aware; the poll-loop's
+ * 5-min watchdog stays as the outer backstop. Operator-overridable via host env;
+ * set CLAUDE_ENABLE_*_WATCHDOG=0 to fall back to the poll-loop watchdog alone.
+ */
+const CLAUDE_STREAM_IDLE_TIMEOUT_MS = process.env.CLAUDE_STREAM_IDLE_TIMEOUT_MS || '120000';
+const CLAUDE_ENABLE_STREAM_WATCHDOG = process.env.CLAUDE_ENABLE_STREAM_WATCHDOG || '1';
+const CLAUDE_ENABLE_BYTE_WATCHDOG = process.env.CLAUDE_ENABLE_BYTE_WATCHDOG || '1';
+
+/**
  * Stale-session detection. Matches Claude Code's error text when a
  * resumed session can't be found — missing transcript .jsonl, unknown
  * session ID, etc.
  */
 const STALE_SESSION_RE = /no conversation found|ENOENT.*\.jsonl|session.*not found/i;
+
+/**
+ * The CLI byte watchdog throws this when it aborts a silently-stalled stream.
+ * Treated as a clean stream-end (resume from cached prefix), not a user error.
+ */
+const STREAM_IDLE_RE = /stream idle timeout|partial response received/i;
 
 export class ClaudeProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = true;
@@ -343,6 +364,9 @@ export class ClaudeProvider implements AgentProvider {
     this.env = {
       ...(options.env ?? {}),
       CLAUDE_CODE_AUTO_COMPACT_WINDOW,
+      CLAUDE_STREAM_IDLE_TIMEOUT_MS,
+      CLAUDE_ENABLE_STREAM_WATCHDOG,
+      CLAUDE_ENABLE_BYTE_WATCHDOG,
     };
   }
 
@@ -426,6 +450,7 @@ export class ClaudeProvider implements AgentProvider {
 
     async function* translateEvents(): AsyncGenerator<ProviderEvent> {
       let messageCount = 0;
+      try {
       for await (const message of sdkResult) {
         if (aborted) return;
         messageCount++;
@@ -451,6 +476,18 @@ export class ClaudeProvider implements AgentProvider {
           const tn = message as { summary?: string };
           yield { type: 'progress', message: tn.summary || 'Task notification' };
         }
+      }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (STREAM_IDLE_RE.test(msg)) {
+          // CLI byte watchdog aborted a silently-stalled stream. The session
+          // continuation was already persisted on the `init` event, so end
+          // cleanly and let the poll loop resume from the cached prefix —
+          // don't propagate it as a user-facing error.
+          log(`CLI stream-idle watchdog fired (${msg}) — ending stream for clean resume`);
+          return;
+        }
+        throw err;
       }
       log(`Query completed after ${messageCount} SDK messages`);
     }
