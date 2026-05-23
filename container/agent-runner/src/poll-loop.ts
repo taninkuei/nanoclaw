@@ -1,7 +1,7 @@
 import { findByName, getAllDestinations, type DestinationEntry } from './destinations.js';
 import { getPendingMessages, markProcessing, markCompleted, type MessageInRow } from './db/messages-in.js';
 import { writeMessageOut } from './db/messages-out.js';
-import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
+import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks, isToolInFlight } from './db/connection.js';
 import { clearContinuation, migrateLegacyContinuation, setContinuation } from './db/session-state.js';
 import { clearCurrentInReplyTo, setCurrentInReplyTo } from './current-batch.js';
 import {
@@ -17,6 +17,11 @@ import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
+// If no SDK event arrives for this long AND no tool is in flight, the stream
+// has silently stalled (e.g. post-compaction hang). End it so the outer loop
+// restarts cleanly — well before the host's 30-min kill ceiling.
+const STREAM_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+const STREAM_WATCHDOG_INTERVAL_MS = 15_000;
 
 function log(msg: string): void {
   console.error(`[poll-loop] ${msg}`);
@@ -291,6 +296,21 @@ async function processQuery(
   // will kill the container and messages get reset to pending.
   let pollInFlight = false;
   let endedForCommand = false;
+  let lastEventAt = Date.now();
+
+  // Watchdog: end the stream if no SDK event arrives for STREAM_IDLE_TIMEOUT_MS
+  // and no tool is in flight. Catches silent post-compaction hangs where the SDK
+  // stops emitting events entirely — without this the container waits until the
+  // host's 30-min kill ceiling. Safe for long Bash/tool calls because those set
+  // isToolInFlight()=true via PreToolUse, so the watchdog skips them.
+  const watchdogHandle = setInterval(() => {
+    if (done || isToolInFlight()) return;
+    const idleMs = Date.now() - lastEventAt;
+    if (idleMs > STREAM_IDLE_TIMEOUT_MS) {
+      log(`Stream idle ${Math.round(idleMs / 1000)}s with no tool in flight — ending stream for clean restart`);
+      query.end();
+    }
+  }, STREAM_WATCHDOG_INTERVAL_MS);
   const pollHandle = setInterval(() => {
     if (done || pollInFlight || endedForCommand) return;
     pollInFlight = true;
@@ -372,6 +392,7 @@ async function processQuery(
     for await (const event of query.events) {
       handleEvent(event, routing);
       touchHeartbeat();
+      lastEventAt = Date.now();
 
       if (event.type === 'init') {
         queryContinuation = event.continuation;
@@ -430,6 +451,7 @@ async function processQuery(
   } finally {
     done = true;
     clearInterval(pollHandle);
+    clearInterval(watchdogHandle);
   }
 
   return { continuation: queryContinuation };

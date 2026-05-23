@@ -112,12 +112,22 @@ export function getOutboundDb(): Database {
   return _outbound;
 }
 
+// In-memory mirror of container_state.current_tool so the stream watchdog
+// can check tool-in-flight status without a DB round-trip.
+let _toolInFlight = false;
+
+/** True while a tool call is in progress (between PreToolUse and PostToolUse). */
+export function isToolInFlight(): boolean {
+  return _toolInFlight;
+}
+
 /**
  * Record that a tool is starting. `declaredTimeoutMs` is the tool's own
  * timeout hint when one is available (Bash exposes it in the tool_use input);
  * omit for tools with no declared timeout.
  */
 export function setContainerToolInFlight(tool: string, declaredTimeoutMs: number | null): void {
+  _toolInFlight = true;
   const now = new Date().toISOString();
   getOutboundDb()
     .prepare(
@@ -134,6 +144,7 @@ export function setContainerToolInFlight(tool: string, declaredTimeoutMs: number
 
 /** Clear the in-flight tool — called on PostToolUse / PostToolUseFailure. */
 export function clearContainerToolInFlight(): void {
+  _toolInFlight = false;
   const now = new Date().toISOString();
   getOutboundDb()
     .prepare(
