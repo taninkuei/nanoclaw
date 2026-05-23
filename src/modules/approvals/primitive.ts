@@ -191,7 +191,12 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<voi
     created_at: new Date().toISOString(),
     title,
     options_json: JSON.stringify(normalizedOptions),
+    agent_group_id: session.agent_group_id,
+    channel_type: target.messagingGroup.channel_type,
+    platform_id: target.messagingGroup.platform_id,
   });
+
+  const displayTitle = `🔔 Approval needed — ${agentName}: ${title}`;
 
   const adapter = getDeliveryAdapter();
   if (adapter) {
@@ -204,7 +209,7 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<voi
         JSON.stringify({
           type: 'ask_question',
           questionId: approvalId,
-          title,
+          title: displayTitle,
           question,
           options: APPROVAL_OPTIONS,
         }),

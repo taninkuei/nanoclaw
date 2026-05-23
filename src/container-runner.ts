@@ -326,6 +326,12 @@ function buildMounts(
     mounts.push(...validated);
   }
 
+  // Global attachments directory — images/files downloaded from inbound messages
+  // (e.g. WhatsApp). The formatter tells the agent the path is /workspace/attachments/<name>.
+  const attachmentsDir = path.join(DATA_DIR, 'attachments');
+  fs.mkdirSync(attachmentsDir, { recursive: true });
+  mounts.push({ hostPath: attachmentsDir, containerPath: '/workspace/attachments', readonly: true });
+
   // Provider-contributed mounts (e.g. opencode-xdg)
   if (providerContribution.mounts) {
     mounts.push(...providerContribution.mounts);
